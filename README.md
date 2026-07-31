@@ -181,7 +181,3 @@ Human relevance judgements were used to build the ground-truth labels for the fo
 
 ---
 
-## Authors
-
-Juan, María, Laura, Andrés, Daniel, Gabriel & Javier— Máster en Ingeniería Matemática, Universidad Complutense de Madrid  
-Modelling Week MS 2026 · Management Solutions
