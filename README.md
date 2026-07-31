@@ -210,9 +210,4 @@ python evaluation.py --full-json none
 ### `gt_compare.csv`
 One row per (scope, category) combination with metric values for A and B side by side, plus `delta_<metric> = A − B`. A positive delta means embedding A outperforms B on that metric.
 
----
 
-## Authors
-
-Juan, María, Laura, Andrés, Daniel, Gabriel & Javier — Máster en Ingeniería Matemática, Universidad Complutense de Madrid  
-Modelling Week MS 2026 · Management Solutions
