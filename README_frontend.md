@@ -153,7 +153,4 @@ Serves the artwork image file from disk. `item_id` is the filename stem (e.g. `S
 
 ---
 
-## Authors
 
-Laura, Daniel, Javier, María, Andrés, Juan & Gabriel — Máster en Ingeniería Matemática, Universidad Complutense de Madrid  
-Modelling Week MS 2026 · Management Solutions
