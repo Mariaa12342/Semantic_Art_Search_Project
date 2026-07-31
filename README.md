@@ -127,8 +127,3 @@ The technical document accompanying this project defines the following evaluatio
 Human relevance judgements were used to build the ground-truth labels for the four reference queries used during development.
 
 ---
-
-## Authors
-
-Juan, María, Laura, Javier, Daniel, Andrés & Gabriel — Máster en Ingeniería Matemática, Universidad Complutense de Madrid  
-Modelling Week MS 2026 · Management Solutions
