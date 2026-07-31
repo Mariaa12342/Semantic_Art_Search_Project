@@ -173,8 +173,3 @@ After running Scripts 01–03 the working directory will contain:
 The sample folder produced by Script 03 is designed to be split across multiple machines for parallel VLM description generation. Each machine receives a subset of the images and runs the LLaVA pipeline independently. The resulting JSON files are merged into `full_results.json` before running Script 04.
 
 ---
-
-## Authors
-
-Juan, María, Laura, Andrés, Daniel, Gabriel & Javier — Máster en Ingeniería Matemática, Universidad Complutense de Madrid  
-Modelling Week MS 2026 · Management Solutions
