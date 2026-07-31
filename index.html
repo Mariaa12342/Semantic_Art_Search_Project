@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""
+Semantic Art Search Engine
+==========================
+Backend API — FastAPI Server
+
+This module exposes a REST API that powers the frontend search interface.
+It connects to both vector databases produced by the two ingestion pipelines
+and routes each search request to the appropriate one depending on the
+pipeline selected by the user.
+
+Two search pipelines are supported:
+
+    Pipeline 1 – Text (LLaVA + sentence-transformers)
+        Query  ──► all-mpnet-base-v2 ──► 768-dim vector ──► ChromaDB text DB
+        Indexed documents are rich text strings assembled from LLaVA
+        descriptions and CSV metadata (title, artist, mood, tags…).
+
+    Pipeline 2 – Image (CLIP)
+        Query  ──► CLIP text encoder ──► 512-dim vector ──► ChromaDB image DB
+        Indexed documents are normalised CLIP image embeddings; the shared
+        CLIP latent space allows direct text-to-image comparison.
+
+Models and ChromaDB collections are loaded lazily on first use and cached for
+the lifetime of the process via functools.lru_cache, so the first request to
+each pipeline bears the model-loading cost while subsequent requests are fast.
+
+Endpoints:
+    GET  /api/health              – Liveness check; reports collection sizes.
+    POST /api/search              – Main semantic search endpoint.
+    GET  /api/image/{pipeline}/{id} – Serve an artwork image file from disk.
+    GET  /                        – Serve the static frontend (index.html).
+
+Dependencies:
+    pip install fastapi uvicorn chromadb sentence-transformers
+    pip install torch transformers pandas Pillow
+
+Usage:
+    python backend.py
+    # or
+    uvicorn backend:app --host 0.0.0.0 --port 8000
+"""
+
+from functools import lru_cache
+from pathlib import Path
+
+import chromadb
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+
+# ════════════════════════════════════════════════════════════
+#   CONFIGURATION  ← edit these variables
+# ════════════════════════════════════════════════════════════
+
+BASE = Path(__file__).parent
+
+# Root folder that contains all artwork image files (searched recursively).
+IMAGES_FOLDER    = BASE / "data"
+
+# Pipeline 1 — VLM text embeddings (all-mpnet-base-v2 + LLaVA descriptions).
+TEXT_DB_PATH     = str(BASE / "vector_database_1_full")
+TEXT_COLLECTION  = "rijksmuseum_llava"
+TEXT_MODEL_ID    = "all-mpnet-base-v2"
+
+# Pipeline 2 — CLIP image embeddings.
+IMAGE_DB_PATH    = str(BASE / "vector_database_2_full")
+IMAGE_COLLECTION = "rijksmuseum_artworks"
+CLIP_MODEL_ID    = "openai/clip-vit-base-patch32"
+
+# Metadata CSV used to enrich CLIP results with title / artist / date.
+# The text pipeline stores this information directly in ChromaDB metadata.
+CLIP_CSV_PATH    = BASE / "data" / "metadata.csv"
+
+# ════════════════════════════════════════════════════════════
+
+app = FastAPI(title="Semantic Art Search Engine")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  METADATA LOADING
+# ─────────────────────────────────────────────────────────────────────────────
+
+@lru_cache(maxsize=1)
+def _clip_csv() -> dict:
+    """
+    Load the CLIP pipeline metadata CSV exactly once and return it as a
+    lookup dictionary indexed by artwork ID.
+
+    The CLIP ChromaDB collection stores only low-level image metadata
+    (filename, filepath, category). Title, artist, and date must be
+    joined from the CSV at query time.
+
+    Returns:
+        Dict mapping artwork ID strings to {title, artist, date} dicts.
+        Returns an empty dict if the CSV is missing or cannot be parsed.
+    """
+    try:
+        import pandas as pd
+
+        csv_path = Path(CLIP_CSV_PATH)
+        if not csv_path.exists():
+            print(f"  CSV not found: {CLIP_CSV_PATH}")
+            return {}
+
+        df       = pd.read_csv(csv_path, encoding="utf-8-sig")
+        df["id"] = df["id"].astype(str).str.strip()
+
+        index = {
+            row["id"]: {
+                "title":  str(row.get("title")  or ""),
+                "artist": str(row.get("artist") or ""),
+                "date":   str(row.get("date")   or ""),
+            }
+            for _, row in df.iterrows()
+        }
+        print(f"  CLIP CSV loaded: {len(index)} records")
+        return index
+
+    except Exception as e:
+        print(f"  Error loading CLIP CSV: {e}")
+        return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LAZY MODEL AND COLLECTION LOADING
+# ─────────────────────────────────────────────────────────────────────────────
+
+@lru_cache(maxsize=1)
+def _clip():
+    """
+    Load and cache the CLIP model, processor, and torch module.
+
+    The model is set to eval mode to disable dropout and batch-norm updates,
+    which is required for deterministic inference.
+
+    Returns:
+        Tuple of (CLIPModel, CLIPProcessor, torch).
+    """
+    import torch
+    from transformers import CLIPModel, CLIPProcessor
+
+    model     = CLIPModel.from_pretrained(CLIP_MODEL_ID)
+    model.eval()
+    processor = CLIPProcessor.from_pretrained(CLIP_MODEL_ID)
+    return model, processor, torch
+
+
+@lru_cache(maxsize=1)
+def _mpnet():
+    """
+    Load and cache the all-mpnet-base-v2 Sentence Transformer model.
+
+    Returns:
+        SentenceTransformer instance.
+    """
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(TEXT_MODEL_ID)
+
+
+@lru_cache(maxsize=1)
+def _image_collection():
+    """
+    Open and cache the CLIP image embeddings ChromaDB collection.
+
+    Returns:
+        ChromaDB Collection object for Pipeline 2.
+    """
+    client = chromadb.PersistentClient(path=IMAGE_DB_PATH)
+    return client.get_collection(name=IMAGE_COLLECTION)
+
+
+@lru_cache(maxsize=1)
+def _text_collection():
+    """
+    Open and cache the LLaVA text embeddings ChromaDB collection.
+
+    Returns:
+        ChromaDB Collection object for Pipeline 1.
+    """
+    client = chromadb.PersistentClient(path=TEXT_DB_PATH)
+    return client.get_collection(name=TEXT_COLLECTION)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  QUERY EMBEDDING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def embed_query_clip(query: str) -> list:
+    """
+    Encode a free-text query into a normalised CLIP text embedding.
+
+    Only the text branch of the CLIP model is used. The pixel_values key is
+    explicitly removed from the processor output so that no dummy image needs
+    to be passed through the vision encoder, reducing unnecessary computation.
+
+    Args:
+        query: Free-text search query.
+
+    Returns:
+        L2-normalised 512-dim embedding as a plain Python list.
+    """
+    model, processor, torch = _clip()
+    inputs     = processor(text=[query], images=None, return_tensors="pt", padding=True)
+    text_input = {k: v for k, v in inputs.items() if k != "pixel_values"}
+
+    with torch.no_grad():
+        features = model.text_model(**text_input).pooler_output
+        features = model.text_projection(features)
+
+    features = features / features.norm(dim=-1, keepdim=True)
+    return features.squeeze().tolist()
+
+
+def embed_query_mpnet(query: str) -> list:
+    """
+    Encode a free-text query into a normalised all-mpnet-base-v2 embedding.
+
+    Args:
+        query: Free-text search query.
+
+    Returns:
+        L2-normalised 768-dim embedding as a plain Python list.
+    """
+    return _mpnet().encode(query, normalize_embeddings=True).tolist()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  REQUEST / RESPONSE MODELS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SearchRequest(BaseModel):
+    """
+    Payload for the POST /api/search endpoint.
+
+    Attributes:
+        query:     Free-text search query submitted by the user.
+        pipeline:  Which search pipeline to use: 'image' (CLIP) or 'text' (LLaVA).
+        n_results: Number of results to return (default 6, capped at 50).
+    """
+    query:     str
+    pipeline:  str
+    n_results: int = 6
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  RESULT NORMALISATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalize_hit(pipeline: str, hit_id: str, distance: float, meta: dict) -> dict:
+    """
+    Convert a raw ChromaDB result into a uniform response dict.
+
+    ChromaDB returns cosine distances in [0, 2]. These are converted to a
+    similarity percentage in [0, 100] using: similarity = (1 - d/2) * 100.
+
+    Metadata enrichment differs by pipeline:
+        - image: title/artist/date are looked up from the CLIP CSV by ID.
+        - text:  title/artist/date are already stored in ChromaDB metadata.
+
+    Args:
+        pipeline: 'image' or 'text'.
+        hit_id:   Artwork ID (filename stem).
+        distance: Raw cosine distance returned by ChromaDB.
+        meta:     ChromaDB metadata dict for this result.
+
+    Returns:
+        Normalised result dict with keys: id, similarity, title, artist,
+        date, category, description, filepath.
+    """
+    similarity = round((1.0 - float(distance) / 2.0) * 100, 1)
+
+    if pipeline == "image":
+        csv_meta = _clip_csv().get(hit_id, {})
+        return {
+            "id":          hit_id,
+            "similarity":  similarity,
+            "title":       csv_meta.get("title")  or meta.get("filename", hit_id),
+            "artist":      csv_meta.get("artist", ""),
+            "date":        csv_meta.get("date",   ""),
+            "category":    meta.get("category",   ""),
+            "description": "",
+            "filepath":    meta.get("filepath",   ""),
+        }
+    else:
+        return {
+            "id":          hit_id,
+            "similarity":  similarity,
+            "title":       meta.get("title") or meta.get("file", hit_id),
+            "artist":      meta.get("artist",      ""),
+            "date":        meta.get("date",        ""),
+            "category":    meta.get("category",    ""),
+            "description": meta.get("description", ""),
+            "filepath":    meta.get("image_path",  ""),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+def health():
+    """
+    Liveness and readiness check.
+
+    Attempts to connect to both ChromaDB collections and reports their
+    document counts. A collection that fails to load is reported as
+    unavailable without crashing the server.
+
+    Returns:
+        Dict with 'image' and 'text' keys, each containing
+        {available: bool, count: int}.
+    """
+    status = {}
+    for name, getter in (("image", _image_collection), ("text", _text_collection)):
+        try:
+            status[name] = {"available": True, "count": getter().count()}
+        except Exception as e:
+            status[name] = {"available": False, "count": 0, "error": str(e)}
+    return status
+
+
+@app.post("/api/search")
+def search(req: SearchRequest):
+    """
+    Main semantic search endpoint.
+
+    Encodes the query with the model that matches the requested pipeline,
+    retrieves an over-sampled candidate set from ChromaDB, filters out
+    artworks whose image file cannot be found on disk, and returns the
+    first n_results valid hits.
+
+    Over-sampling ratios:
+        - text pipeline:  n × 10  candidates (tighter embedding space).
+        - image pipeline: n × 50  candidates (wider search to account for
+          images that may have been moved or renamed).
+
+    Args:
+        req: SearchRequest payload.
+
+    Returns:
+        Dict with keys: query, pipeline, results (list of normalised hits).
+
+    Raises:
+        HTTPException 400: Empty query or unknown pipeline value.
+        HTTPException 503: Requested ChromaDB collection unavailable.
+    """
+    query = (req.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Please enter a search query.")
+    n = max(1, min(req.n_results, 50))
+
+    if req.pipeline == "image":
+        try:
+            collection = _image_collection()
+        except Exception:
+            raise HTTPException(status_code=503, detail="Image database unavailable.")
+        query_vector = embed_query_clip(query)
+
+    elif req.pipeline == "text":
+        try:
+            collection = _text_collection()
+        except Exception:
+            raise HTTPException(status_code=503, detail="Text database unavailable.")
+        query_vector  = embed_query_mpnet(query)
+        # Exclude photomechanical prints from text search results as their
+        # LLaVA descriptions tend to be less semantically rich.
+        where_filter  = {"category": {"$nin": ["photomechanical print"]}}
+
+    else:
+        raise HTTPException(
+            status_code=400, detail="pipeline must be 'image' or 'text'."
+        )
+
+    total = collection.count()
+    if total == 0:
+        return {"query": query, "pipeline": req.pipeline, "results": []}
+
+    if req.pipeline == "text":
+        raw = collection.query(
+            query_embeddings=[query_vector],
+            n_results=min(n * 10, total),
+            where=where_filter,
+        )
+    else:
+        raw = collection.query(
+            query_embeddings=[query_vector],
+            n_results=min(n * 50, total),
+        )
+
+    ids       = raw["ids"][0]
+    distances = raw["distances"][0]
+    metadatas = raw["metadatas"][0]
+
+    results = []
+    for hit_id, distance, meta in zip(ids, distances, metadatas):
+        # Strip extension to obtain the bare artwork ID used in the CSV.
+        clean_id = Path(hit_id).stem
+        hit      = _normalize_hit(req.pipeline, clean_id, distance, meta)
+
+        # Only include results whose image file is present on disk.
+        filename = Path(hit_id).name
+        if not filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            filename = filename + ".jpg"
+        found = list(Path(IMAGES_FOLDER).rglob(filename))
+
+        if found:
+            results.append(hit)
+
+        if len(results) >= n:
+            break
+
+    return {"query": query, "pipeline": req.pipeline, "results": results}
+
+
+@app.get("/api/image/{pipeline}/{item_id:path}")
+def get_image(pipeline: str, item_id: str):
+    """
+    Serve an artwork image file from disk.
+
+    Performs a recursive search under IMAGES_FOLDER for a file matching
+    the requested item_id. If the path has no image extension, .jpg is
+    appended as a fallback.
+
+    Args:
+        pipeline: Pipeline identifier ('image' or 'text') — included in the
+                  URL for routing clarity but not used for file lookup.
+        item_id:  Artwork ID or filename (extension optional).
+
+    Returns:
+        FileResponse with the appropriate image MIME type.
+
+    Raises:
+        HTTPException 404: If no matching file is found on disk.
+    """
+    filename = Path(item_id).name
+    if not filename.lower().endswith((".jpg", ".jpeg", ".png")):
+        filename = filename + ".jpg"
+
+    found = list(Path(IMAGES_FOLDER).rglob(filename))
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Image not found: {filename}")
+
+    suffix    = found[0].suffix.lower()
+    media_type = {
+        ".jpg":  "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png":  "image/png",
+    }.get(suffix, "application/octet-stream")
+
+    return FileResponse(str(found[0]), media_type=media_type)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STATIC FRONTEND
+# ─────────────────────────────────────────────────────────────────────────────
+
+STATIC_DIR = BASE / "static"
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/")
+def index():
+    """Serve the single-page frontend application."""
+    return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
